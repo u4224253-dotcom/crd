@@ -1,0 +1,92 @@
+name: Build APK
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # perlu untuk membuat GitHub Release saat push tag
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract project from ChordFinderIsland.zip
+        run: |
+          if [ -f settings.gradle.kts ]; then
+            echo "Project sudah ada di root, tidak perlu unzip."
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+          else
+            mkdir -p project
+            # -DD = jangan pakai timestamp dari zip. Zip dibuat di WITA (UTC+8) tanpa info zona waktu,
+            # jadi di runner (UTC) file tampak ~8 jam "dari masa depan" dan ninja menganggap
+            # build.ninja selalu dirty ("still dirty after 100 tries").
+            unzip -q -o -DD ChordFinderIsland.zip -d project
+            find project -exec touch {} +
+            SETTINGS=$(find project -maxdepth 3 -name settings.gradle.kts | head -n 1)
+            if [ -z "$SETTINGS" ]; then echo "settings.gradle.kts tidak ketemu"; exit 1; fi
+            echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> "$GITHUB_ENV"
+          fi
+
+      - name: Unduh model Beat This! (small, ONNX) untuk deteksi BPM
+        run: |
+          DEST="$PROJECT_DIR/app/src/main/assets/beat_this.onnx"
+          if [ -f "$DEST" ]; then echo "Model sudah ada di repo, tidak diunduh."; exit 0; fi
+          mkdir -p "$(dirname "$DEST")"
+          URL="https://huggingface.co/nilsbc/beat-this-onnx/resolve/main/beat_this_small0.onnx"
+          SHA="53fda6e96afae7f44d898fa5f020272eda967a92839306bf7a3d0898fb8a0d9a"
+          if curl -fL --retry 3 -o "$DEST.tmp" "$URL" && echo "$SHA  $DEST.tmp" | sha256sum -c -; then
+            mv "$DEST.tmp" "$DEST"; ls -l "$DEST"
+          else
+            rm -f "$DEST.tmp"
+            echo "::warning::Model Beat This! gagal diunduh atau checksum tidak cocok. APK tetap dibuat, tanpa fitur BPM."
+          fi
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Accept Android licenses
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build debug APK
+        run: |
+          cd "$PROJECT_DIR"
+          gradle :app:assembleDebug --stacktrace
+          cp app/build/outputs/apk/debug/app-debug.apk "$GITHUB_WORKSPACE/ChordFinderIsland.apk"
+
+      - name: Cek APK (ukuran, integritas zip, manifest, tanda tangan)
+        run: |
+          APK="$GITHUB_WORKSPACE/ChordFinderIsland.apk"
+          ls -l "$APK"
+          unzip -tq "$APK" || true
+          BT=$(ls "$ANDROID_HOME/build-tools" | sort -V | tail -n 1)
+          "$ANDROID_HOME/build-tools/$BT/aapt" dump badging "$APK" | grep -E "^package|sdkVersion|native-code|application-label:" || true
+          "$ANDROID_HOME/build-tools/$BT/apksigner" verify --verbose "$APK" || true
+          unzip -lv "$APK" | grep -E "\.so$|\.onnx$|\.lkm$" || true
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ChordFinderIsland-apk
+          path: ChordFinderIsland.apk
+          if-no-files-found: error
+
+      - name: Publish GitHub Release (tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ChordFinderIsland.apk
